@@ -1,62 +1,53 @@
 import streamlit as st
-from openai import OpenAI
-import base64
-import io
+from gradio_client import Client, handle_file
 import zipfile
-import requests
+import io
+import os
+import tempfile
 from PIL import Image
 
 # Set page config
-st.set_page_config(page_title="AI Image Modifier", page_icon="🎨", layout="wide")
+st.set_page_config(page_title="Free AI Image Modifier", page_icon="🎨", layout="wide")
 
 # Initialize session state for storing results
 if "processed_images" not in st.session_state:
     st.session_state.processed_images = []
 
-def encode_image(uploaded_file):
-    """Encode the uploaded image to base64 for GPT-4o Vision."""
-    return base64.b64encode(uploaded_file.getvalue()).decode('utf-8')
+def generate_modified_image(image_bytes, user_prompt):
+    """Uses a free Hugging Face server (Instruct-Pix2Pix) - No API Key needed!"""
+    
+    # The Gradio client requires a physical file path, so we save the upload temporarily
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as temp_in:
+        temp_in.write(image_bytes)
+        temp_in_path = temp_in.name
 
-def generate_modified_image(client, image_file, user_prompt):
-    """Pipeline: GPT-4o analyzes image + prompt -> DALL-E 3 generates new image."""
-    base64_image = encode_image(image_file)
-    
-    # Step 1: Use GPT-4o to analyze the image and incorporate the user's prompt
-    vision_response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text", 
-                        "text": f"You are an expert prompt engineer. Analyze this image in detail. Then, apply the following user request to modify it: '{user_prompt}'. Output ONLY a highly detailed DALL-E 3 image generation prompt that recreates this image with the requested modifications. Do not include any conversational text."
-                    },
-                    {
-                        "type": "image_url", 
-                        "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
-                    }
-                ]
-            }
-        ]
-    )
-    
-    dalle_prompt = vision_response.choices[0].message.content.strip()
-    
-    # Step 2: Generate the new image using DALL-E 3
-    image_response = client.images.generate(
-        model="dall-e-3",
-        prompt=dalle_prompt,
-        size="1024x1024",
-        quality="standard",
-        n=1
-    )
-    
-    image_url = image_response.data[0].url
-    
-    # Fetch the actual image data
-    img_data = requests.get(image_url).content
-    return img_data
+    try:
+        # Connect to the public, completely free Instruct-Pix2Pix Hugging Face space
+        client = Client("timbrooks/instruct-pix2pix")
+        
+        # Send the image and prompt to the free server
+        result = client.predict(
+            prompt=user_prompt,
+            image=handle_file(temp_in_path),
+            text_cfg_scale=7.5,
+            image_cfg_scale=1.5,
+            randomize_seed=True,
+            seed=0,
+            api_name="/generate"
+        )
+        
+        # Gradio returns the file path to the newly generated image
+        output_path = result[0] if isinstance(result, tuple) else result
+        
+        with open(output_path, "rb") as f:
+            output_bytes = f.read()
+            
+        return output_bytes
+        
+    finally:
+        # Clean up the temporary input file from the server
+        if os.path.exists(temp_in_path):
+            os.remove(temp_in_path)
 
 def create_zip(image_data_list):
     """Package multiple images into a single ZIP file."""
@@ -67,47 +58,36 @@ def create_zip(image_data_list):
     return zip_buffer.getvalue()
 
 # --- UI Layout ---
-st.title("🎨 AI Image Modifier")
-st.markdown("Upload one or multiple images, provide a prompt, and let ChatGPT modify them.")
-
-# Sidebar for API Key
-with st.sidebar:
-    st.header("Configuration")
-    api_key = st.text_input("OpenAI API Key", type="password", help="Enter your OpenAI API key here.")
-    st.markdown("---")
-    st.markdown("### How it works:")
-    st.markdown("1. Upload image(s)\n2. Enter a modification prompt\n3. GPT-4o interprets the image + prompt\n4. DALL-E 3 generates the result")
+st.title("🎨 Free AI Image Modifier")
+st.markdown("Upload images, type an instruction (e.g., 'Make it look like a watercolor painting'), and modify them instantly for free.")
 
 # Main content
 uploaded_files = st.file_uploader("Upload Image(s)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
 user_prompt = st.text_input("Enter your modification prompt:", placeholder="e.g., Change the background to a futuristic city, make it cyberpunk style...")
 
 if st.button("Modify Image(s)", type="primary"):
-    if not api_key:
-        st.error("Please enter your OpenAI API key in the sidebar.")
-    elif not uploaded_files:
+    if not uploaded_files:
         st.warning("Please upload at least one image.")
     elif not user_prompt:
         st.warning("Please enter a prompt to modify the image.")
     else:
-        client = OpenAI(api_key=api_key)
         st.session_state.processed_images = [] # Clear previous results
         
         progress_bar = st.progress(0)
         status_text = st.empty()
         
         for i, file in enumerate(uploaded_files):
-            status_text.text(f"Processing image {i+1} of {len(uploaded_files)}...")
+            status_text.text(f"Processing image {i+1} of {len(uploaded_files)}... (This may take 10-20 seconds on the free server)")
             try:
                 # Generate modified image
-                modified_img_data = generate_modified_image(client, file, user_prompt)
+                modified_img_data = generate_modified_image(file.getvalue(), user_prompt)
                 st.session_state.processed_images.append({
                     "original_name": file.name,
                     "original_data": file.getvalue(),
                     "modified_data": modified_img_data
                 })
             except Exception as e:
-                st.error(f"Error processing {file.name}: {str(e)}")
+                st.error(f"Error processing {file.name}. The free server might be busy, please try again. Details: {str(e)}")
             
             # Update progress
             progress_bar.progress((i + 1) / len(uploaded_files))
